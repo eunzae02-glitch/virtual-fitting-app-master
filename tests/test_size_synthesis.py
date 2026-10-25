@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT/'scripts'))
 from debug_size_preview import CHART_SOURCES, build_ui, compare_dimensions
 from fit_plan import create_fit_plan
 from garment_outline import confirm_anchors, create_preview, new_marks, photo_info
+from garment_repair import REPAIR_VERSION
 from garment_mask_editor import GarmentMaskEditor, encode_png
 from size_synthesis import (adjust_size, adjust_sizes, bind_base, checked_preview, draft_mask, editor_mask,
                             editor_value, engine_settings, generate_base)
@@ -85,7 +86,7 @@ class TestSizeSynthesis(unittest.TestCase):
         red = (image[:, :, 0] > 160) & (image[:, :, 1] < 90) & (image[:, :, 2] < 90)
         self.assertTrue(red.any())
         self.assertEqual(int((red & ~target).sum()), 0)  # v0 leaked 708 red pixels below the target hem
-        self.assertEqual(result['report']['repair_method'], 'garment_excluded_telea_v1')
+        self.assertEqual(result['report']['repair_method'], REPAIR_VERSION)
         self.assertEqual(result['report']['changed_pixels'], int(np.any(image != np.asarray(self.base), axis=2).sum()))
 
     def test_all_sizes_share_base_but_have_independent_target_and_rgb_hashes(self):
@@ -209,6 +210,10 @@ class TestSizeSynthesis(unittest.TestCase):
             self.assertEqual(data['adjusted_sha256'], data['size_comparison']['rows'][0]['adjusted_sha256'])
             with Image.open(Path(files[0]).parent/'adjusted.png') as image:
                 self.assertTrue(np.array_equal(np.asarray(image), np.asarray(result['image'])))
+            for name in ('reference_reused_mask.png', 'estimated_repair_mask.png', 'repair_overlay.png'):
+                self.assertTrue((Path(files[0]).parent/name).is_file())
+            self.assertEqual(data['repair']['reused_reference_pixels']+data['repair']['estimated_pixels'],
+                             data['repair_pixels'])
 
 
 class TestSynthesisUI(unittest.TestCase):

@@ -1,5 +1,6 @@
 """FASHN 기본 합성과 확인한 옷 마스크를 목표 윤곽에 연결하는 CPU 후처리 실험."""
 import copy
+from collections import OrderedDict
 import hashlib
 import html
 import importlib.util
@@ -10,12 +11,18 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 from fit_plan import create_fit_plan
 from garment_outline import create_preview, photo_info, prepare_photo
+from garment_repair import repair_exposed, repair_overlay
+
+
+_repair_reference_masks = OrderedDict()
+_repair_reference_lock = threading.Lock()
 
 
 def checked_preview(preview, person):
@@ -169,6 +176,23 @@ def editor_value(base, mask):
             'composite': None}
 
 
+def _reference_repair_mask(person, preview):
+    """복원 전용 기존 옷 제외 초안. 자동 기준점은 만들지 않는다. 최근 4개 마스크만 메모리에 둔다."""
+    key = (preview['photo']['sha256'], _digest(preview['reference_points_px']))
+    with _repair_reference_lock:
+        if key not in _repair_reference_masks:
+            try:
+                mask = np.asarray(draft_mask(person, preview)) > 127
+                mask.setflags(write=False)
+            except ValueError:
+                mask = None
+            _repair_reference_masks[key] = mask
+            if len(_repair_reference_masks) > 4:
+                _repair_reference_masks.popitem(last=False)
+        _repair_reference_masks.move_to_end(key)
+        return _repair_reference_masks[key]
+
+
 def editor_mask(value, base):
     if not value or value.get('background') is None:
         raise ValueError('기본 합성 사진과 옷 영역을 먼저 불러와주세요.')
@@ -271,15 +295,10 @@ def adjust_size(person, base, metadata, preview, mask, confirmed=False):
     if not warped_mask.any():
         raise ValueError('변형 후 옷 영역이 없습니다. 마스크와 목표선을 확인해주세요.')
     repair = source_mask & ~warped_mask
-    canvas = original.copy()
-    if repair.any():
-        # 사라진 부분만 inpaint하면 남은 옷이 주변색으로 유입돼 이전 밑단이 남는다.
-        # 복원용 영상에서는 기존 옷 전체(경계 1px 포함)를 제외한 뒤 필요한 부분만 가져온다.
-        excluded = cv2.dilate(source_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
-        if excluded.all():
-            raise ValueError('옷 밖 복원 참고 영역이 없습니다. 옷 마스크를 확인해주세요.')
-        clean = cv2.inpaint(original, excluded*255, 3, cv2.INPAINT_TELEA)
-        canvas[repair] = clean[repair]
+    reference_mask = _reference_repair_mask(prepare_photo(person), preview) if repair.any() else None
+    canvas, reused, estimated, repair_info = repair_exposed(
+        prepare_photo(person), base, source_mask, warped_mask, (neck, vx, vy),
+        preview['reference_points_px'], below, reference_mask)
     # 옷 안쪽에서만 경계를 섞는다. 편집 영역 밖은 기본 합성과 화소 단위로 동일하다.
     alpha = np.clip(cv2.distanceTransform(warped_mask.astype(np.uint8), cv2.DIST_L2, 3)/2, 0, 1)[..., None]
     output = np.rint(warped*alpha + canvas*(1-alpha)).astype(np.uint8)
@@ -299,17 +318,21 @@ def adjust_size(person, base, metadata, preview, mask, confirmed=False):
               'adjusted_sha256': photo_info(Image.fromarray(output))['sha256'],
               'target_mask_sha256': hashlib.sha256(warped_mask.tobytes()).hexdigest(),
               'target_mask_bbox_px': [int(mask_x.min()), int(mask_y.min()), int(mask_x.max()), int(mask_y.max())],
-              'repair_method': 'garment_excluded_telea_v1',
+              'repair_method': repair_info['method'], 'repair': repair_info,
               'outside_edit_max_pixel_difference': int(np.abs(output.astype(int)-original.astype(int))[~edit].max())
               if (~edit).any() else 0,
               'notes': ['기본 합성 결과에서 확인한 옷 영역을 목표선에 맞춘 2D 후처리 실험입니다.',
                         '생성된 옷의 길이와 폭은 마스크에서 읽습니다. 기본 합성에 특정 상품 사이즈를 가정하지 않습니다.',
-                        '줄어든 부분은 기존 옷 전체를 제외한 영상에서 Telea로 복원합니다. 가려졌던 신체·배경의 정답 복원이 아닙니다.',
+                        '드러난 영역 중 원본에서 이미 보이는 밑단 아래 부분만 보수적으로 재사용합니다. 원본의 옷 추출 초안과 밑단 주변은 복사 대상에서 제외합니다.',
+                        '원본 미관측 또는 정합 불확실로 재사용하지 못한 부분은 밑단 아래/옆 패치를 방향별로 연장한 추정입니다. 피부·바지의 실제 모습이나 생성형 복원을 보장하지 않습니다.',
                         '어깨·소매 구조 보정과 실제 착용 핏 정확도는 검증하지 않았습니다.',
                         '편집 영역 밖은 기본 합성 사진을 유지합니다. FASHN 자체가 바꾼 얼굴·배경은 이 단계의 보존 대상과 별개입니다.']}
     return {'image': Image.fromarray(output), 'mask': Image.fromarray(source_mask.astype(np.uint8)*255),
             'target_mask': Image.fromarray(warped_mask.astype(np.uint8)*255),
-            'repair_mask': Image.fromarray(repair.astype(np.uint8)*255), 'report': report}
+            'repair_mask': Image.fromarray(repair.astype(np.uint8)*255),
+            'reference_reused_mask': Image.fromarray(reused.astype(np.uint8)*255),
+            'estimated_repair_mask': Image.fromarray(estimated.astype(np.uint8)*255),
+            'repair_overlay': repair_overlay(base, reused, estimated), 'report': report}
 
 
 def adjust_sizes(person, base, metadata, preview, mask, confirmed=False):
@@ -340,7 +363,7 @@ def adjust_sizes(person, base, metadata, preview, mask, confirmed=False):
                               'target_geometry_px': data['target_geometry_px'],
                               'adjusted_sha256': data['adjusted_sha256'],
                               'target_mask_sha256': data['target_mask_sha256'],
-                              'changed_pixels': data['changed_pixels']})
+                              'changed_pixels': data['changed_pixels'], 'repair': data['repair']})
         except ValueError as exc:
             withheld.append({'size': label, 'reason': str(exc)})
     result['report']['size_comparison'] = {'rows': summaries, 'withheld': withheld,
@@ -360,6 +383,10 @@ def synthesis_report(result):
             f"편집 영역 밖 최대 화소 차이: **{data['outside_edit_max_pixel_difference']}** / "
             f"복원 영역: **{data['repair_pixels']:,} px**\n\n"
             + '\n\n'.join(data['notes']))
+    repaired = data['repair']
+    text += (f"\n\n복원 구분: 원본 재사용 **{repaired['reused_reference_pixels']:,} px** / "
+             f"방향성 패치 추정 **{repaired['estimated_pixels']:,} px**. "
+             '초록색은 원본 재사용, 주황색은 원본을 재사용하지 못해 패치로 추정한 영역입니다.')
     comparison = data.get('size_comparison')
     if comparison:
         lines = ['| 사이즈 | 목 기준 밑단(px) | 목표 몸통 폭(px) | 변경 화소 |',

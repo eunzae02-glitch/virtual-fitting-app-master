@@ -32,6 +32,9 @@ def save_synthesis(result, person, base, garment=None, output_directory=None):
     images = {'person.png': prepare_photo(person), 'base.png': prepare_photo(base),
               'adjusted.png': result['image'], 'source_mask.png': result['mask'],
               'target_mask.png': result['target_mask'], 'repair_mask.png': result['repair_mask'],
+              'reference_reused_mask.png': result['reference_reused_mask'],
+              'estimated_repair_mask.png': result['estimated_repair_mask'],
+              'repair_overlay.png': result['repair_overlay'],
               'adjusted_overlay.png': render_outline(result['image'], preview=data['preview'])}
     if garment is not None:
         images['garment.png'] = prepare_photo(garment)
@@ -84,7 +87,8 @@ def add_synthesis_ui(gr, preview, person, reset_controls=(), reset_buttons=(), p
     with gr.Accordion('편집·복원 영역 확인', open=False):
         with gr.Row():
             target_mask = gr.Image(type='pil', format='png', interactive=False, label='변형 후 옷 영역', height=270)
-            repair_mask = gr.Image(type='pil', format='png', interactive=False, label='줄어들어 복원한 영역', height=270)
+            repair_mask = gr.Image(type='pil', format='png', interactive=False,
+                                   label='복원 구분 · 초록: 원본 재사용 / 주황: 패치 추정', height=270)
     save = gr.Button('현재 합성·사이즈 조정 실험 저장')
     downloads = gr.File(file_count='multiple', label='원본 · 기본 합성 · 조정 결과 · 마스크 · 설정 · 보고서')
     saved = gr.Markdown()
@@ -150,7 +154,7 @@ def add_synthesis_ui(gr, preview, person, reset_controls=(), reset_buttons=(), p
         try:
             result, comparisons = calculate(*values)
             return (result['image'], render_outline(result['image'], preview=result['report']['preview']),
-                    comparisons, synthesis_report(result), result['target_mask'], result['repair_mask'], [], '')
+                    comparisons, synthesis_report(result), result['target_mask'], result['repair_overlay'], [], '')
         except (ValueError, TypeError, KeyError, ImportError) as exc:
             return None, None, [], f'사이즈 적용을 보류했습니다. {exc}', None, None, [], ''
 

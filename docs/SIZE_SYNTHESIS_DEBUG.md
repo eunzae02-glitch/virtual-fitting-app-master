@@ -75,6 +75,24 @@ Chrome에서 **기본 합성 → 확인 → 지우개 → 재확인 → 브러�
 이미 준비한 가중치를 다시 다운로드할 필요는 없고, 저장한 기본 합성 PNG도 재사용할 수 있다.
 새 화면의 `브러시 / 지우개 / 크기 / 초안으로 되돌리기`가 보이면 수정본이다.
 
+### Colab 3번 셀 설치 충돌 수정
+
+사용자 Python 3.13.16의 pip 로그에서 `ResolutionImpossible`을 확인했다.
+Gradio 6.30.0은 `huggingface-hub>=1.16,<3`을 요구하지만, 기존 셀의
+`transformers>=4.40,<5`는 `huggingface-hub<1.0`을 요구해 동시에 설치할 수 없었다.
+Gradio 미배포나 CUDA 합성 오류가 아니라 설치 셀의 서로 모순되는 의존성 제한이었다.
+
+사이즈 화면에서 확인한 Gradio를 유지하고, 해당 노트북 3번 셀의 Transformers를
+`5.20.2`로, Hub 범위를 `>=1.31,<3`으로 수정했다.
+[Transformers 5.20.2 배포 메타데이터](https://pypi.org/pypi/transformers/5.20.2/json)의 Hub 요구 범위와
+Gradio 요구 범위가 겹침을 확인했다. FASHN Human Parser가 사용하는
+`SegformerForSemanticSegmentation`은 해당 버전의 공식 소스에서 확인했다.
+pip 출력은 명시적으로 캡처해 표시하고, 설치 뒤 별도 프로세스에서 SegFormer·Human Parser·FASHN의
+import를 확인한다. import 실패 시에는 4·5번 셀로 넘어가지 않는다.
+로컬에서는 셀 구문·명령 구성·실패 출력 보존을 모의 실행으로 검증했다.
+새 조합의 실제 Colab 설치·캐시된 가중치 로딩·CUDA 합성은 사용자의 런타임에서 확인해야 한다.
+다른 과거 엔진의 의존성까지 일괄 변경하거나 `--no-deps`로 충돌을 무시하지 않는다.
+
 ## 1. 조사 결론
 
 **가장 먼저 확인할 원인은 목표선과 기본 합성의 연결 방식이다. 기존 FASHN 호출에는

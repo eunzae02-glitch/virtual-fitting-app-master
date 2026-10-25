@@ -1,0 +1,5 @@
+# CPU-only body measurement training and local debugging.
+numpy>=2.0,<3
+openpyxl>=3.1,<4
+scikit-learn>=1.7,<2
+gradio>=5,<7

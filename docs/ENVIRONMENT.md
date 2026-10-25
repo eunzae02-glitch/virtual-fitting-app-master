@@ -1,0 +1,204 @@
+# 환경 구성 기록 — CatVTON을 실제로 돌리기까지
+
+2026-09-08 기준. Kaggle/Colab에서 CatVTON을 돌리며 실제로 부딪힌 문제와 해결책 전부.
+**결론부터: repo가 요구하는 Python 3.9 환경을 그대로 만드는 게 정답이다.** 최신 환경에 억지로
+끼워맞추면 아래 문제들을 순서대로 다 밟게 된다.
+
+## 핵심 원인
+
+CatVTON repo는 2024년 환경(Python 3.9.0 + torch 2.1.2)을 전제로 만들어졌고,
+**detectron2를 소스 빌드하지 않고 cp39용으로 미리 컴파일된 `.so` 바이너리를 repo에 포함**시켰다.
+
+```
+CatVTON/detectron2/_C.cpython-39-x86_64-linux-gnu.so   <- Python 3.9 전용
+```
+
+컴파일된 확장 모듈은 파이썬 버전이 다르면 ABI가 안 맞아 import 자체가 불가능하다.
+2026년 현재 Colab/Kaggle 기본은 **Python 3.12 + torch 2.10**이라 그대로는 절대 안 된다.
+
+## 밟은 지뢰들 (시간순)
+
+### 1. `ModuleNotFoundError: No module named 'fvcore'`
+`AutoMasker` → `model/DensePose` → `densepose` → `detectron2` 체인에서 발생.
+repo의 `requirements.txt`에 **detectron2 런타임 의존성이 아예 빠져 있다.**
+
+추가로 필요: `fvcore iopath pycocotools omegaconf hydra-core termcolor yacs tabulate cloudpickle`
+
+### 2. Kaggle P100 GPU가 최신 torch에서 지원 종료
+```
+Tesla P100-PCIE-16GB with CUDA capability sm_60 is not compatible with the current PyTorch installation.
+The current PyTorch install supports CUDA capabilities sm_70 sm_75 sm_80 sm_86 sm_90 sm_100 sm_120.
+```
+torch 2.10은 Pascal(sm_60) 지원을 뺐다. Kaggle이 P100을 배정하면 CPU로 떨어진다.
+→ **T4(sm_75) 이상을 쓰거나, repo가 고정한 torch 2.1.2를 쓰면 P100도 동작한다.**
+
+### 3. `transformers==4.27.3` 설치 실패 (Python 3.12에서)
+```
+Building wheel for tokenizers (pyproject.toml) did not run successfully
+```
+구버전 tokenizers는 cp312용 prebuilt wheel이 없어 소스 빌드를 시도하다 실패.
+**Python 3.9에서는 cp39 wheel이 있어 정상 설치된다.**
+
+### 4. `huggingface_hub==0.23.4`로 다운그레이드 → 최신 transformers 파손
+```
+ImportError: cannot import name 'is_offline_mode' from 'huggingface_hub'
+```
+베이스 이미지의 최신 transformers/accelerate/datasets가 최신 huggingface_hub API에 의존하는데,
+구버전으로 강제 다운그레이드하면 그 위에 얹힌 것들이 다 깨진다.
+→ **최신 환경에서는 버전을 낮추지 말고, 격리된 venv 안에서만 맞출 것.**
+
+### 5. `StableDiffusionSafetyChecker` API 불일치
+```
+AttributeError: 'StableDiffusionSafetyChecker' object has no attribute 'all_tied_weights_keys'
+```
+diffusers 0.29.2(2024)의 safety checker를 transformers 5.x(2026)가 로드하면서 발생.
+→ `CatVTONPipeline(..., skip_safety_check=True)` 로 회피 가능 (repo에 이미 옵션 있음).
+
+### 6. `ModuleNotFoundError: No module named 'av'`
+densepose의 `data/video/video_keyframe_dataset.py`가 PyAV를 import한다.
+가상 피팅에 비디오는 안 쓰지만 **import 체인에 걸려 있어서 반드시 설치해야 한다.**
+이것도 repo `requirements.txt`에 없다. → `pip install av`
+
+### 7. `ValueError: Key backend: 'module://matplotlib_inline.backend_inline' is not a valid value`
+Colab이 `MPLBACKEND` 환경변수를 inline 백엔드로 설정해두는데, 이게 subprocess로 상속되면
+venv 안의 matplotlib이 그 백엔드를 못 찾아 죽는다.
+→ 워커 실행 시 `MPLBACKEND=Agg`로 덮어쓸 것.
+
+### 8. `TypeError: argument of type 'bool' is not iterable` (gradio)
+Gradio 앱을 띄우면 페이지가 안 열리고 이 에러가 반복된다.
+pydantic이 만드는 JSON 스키마에는 `additionalProperties: true` 처럼 값이 dict가 아니라
+bool인 항목이 있는데, `gradio_client/utils.py`의 `get_type()`이 dict로 가정하고
+`"const" in schema` 를 실행해서 터진다.
+
+- gradio 4.44.1로 올려도 발생한다.
+- `launch(show_api=False)` 로도 못 막는다 — 메인 라우트(`routes.py`)가 옵션과 무관하게
+  `api_info()`를 호출한다.
+- **해결**: venv에 설치된 `gradio_client/utils.py`의 `get_type` / `_json_schema_to_python_type`
+  앞에 `if not isinstance(schema, dict): return "Any"` 가드를 삽입한다.
+  `scripts/run_gradio_colab.py`가 실행 시 자동으로 패치한다(멱등).
+
+### 9. Gradio 공개 링크가 출력되지 않음
+`로딩 완료` 까지 찍히고 `Running on public URL: ...` 이 안 보인다. 앱은 정상 실행 중인데
+**출력 버퍼링** 때문에 안 보이는 것.
+자식 프로세스의 stdout이 파이프면 블록 버퍼링(4KB)이라, `flush=True` 없는 gradio 내부
+print가 버퍼에 갇힌다.
+→ 자식을 `python -u` 로 실행하고 `PYTHONUNBUFFERED=1` 을 준다. 추가로 `launch(prevent_thread_lock=True)`
+가 반환하는 URL을 직접 `flush=True`로 출력한 뒤 `demo.block_thread()` 로 대기한다.
+
+### 10. `torch.compile`이 조용히 무시된다 (Kaggle P100)
+가속 실험에서 `torch.compile`을 켠 설정과 안 켠 설정의 시간이 소수점까지 같았다.
+"컴파일했는데 이득이 없다"로 읽기 쉽지만 사실은 **컴파일이 되지 않았다.**
+
+`torch.compile`의 기본 백엔드(Inductor)는 Triton으로 커널을 만드는데
+**Triton은 compute capability 7.0 이상**을 요구한다. Kaggle 기본 GPU인
+P100은 **6.0**이라 조건에 못 미치고, 이때 torch.compile은 예외를 던지지 않고
+**조용히 eager 실행으로 되돌아간다.** 로그에 아무것도 안 남아서
+"효과 없음"과 "동작 안 함"이 구별되지 않는다 — 결론이 정반대인데도.
+
+→ 가속 실험 전에 `torch.cuda.get_device_capability()`를 찍고, 작은 함수를
+   실제로 컴파일해봐서 되는지 확인할 것 (`scripts/speed_opt_check.py`의 `compile_probe`).
+→ T4는 7.5라 조건을 만족한다. **Kaggle에서 GPU 종류는 kernel-metadata.json으로
+   못 바꾼다** (`"gpu": "T4 x2"` 를 넣어도 무시됨). 커널 페이지의 Settings →
+   Accelerator 에서 직접 바꿔야 한다.
+
+### 11. Triton이 `libcuda.so`를 못 찾는다 (Kaggle T4)
+P100(sm_60)에서 못 돌던 `torch.compile`을 T4(sm_75)에서 다시 시도하니 이번엔
+capability는 통과했는데 다른 데서 막혔다.
+
+```
+BackendCompilerFailed: backend='inductor' raised:
+AssertionError: libcuda.so cannot found!
+```
+
+컨테이너에 드라이버 라이브러리가 `libcuda.so.1` 로만 있고 링커가 찾는 `libcuda.so`
+이름이 없어서 Triton이 포기한다. 여기서도 torch.compile은 **예외를 삼키고 eager로
+되돌아가므로** 그냥 두면 "느려지지도 빨라지지도 않는" 결과만 남는다.
+
+→ 심볼릭 링크를 만들거나 경로를 알려준다:
+```bash
+ln -sf /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so
+# 또는
+export TRITON_LIBCUDA_PATH=/usr/lib/x86_64-linux-gnu
+```
+
+### 12. Kaggle 커널의 GPU 종류는 API로 못 바꾼다
+`kernel-metadata.json` 에 `"gpu": "T4 x2"` 를 넣어도 **무시된다**(push는 성공한다).
+커널 페이지 → **Session options → Accelerator** 에서 바꾼 뒤 `Save & Run All` 로
+실행해야 한다. 한 번 바꾸면 그 커널은 설정을 기억한다.
+
+### 13. T4는 연속 실행하면 느려진다 (측정 설계 주의)
+같은 설정을 연달아 재는데 시간이 17.0 → 17.6 → 18.4초로 계속 올라갔다.
+T4는 지속 부하에서 클럭이 떨어진다. **먼저 잰 설정이 유리해지므로**, 설정 A와 B를
+순서대로 한 번씩 재고 비교하면 순서 효과를 최적화 효과로 착각한다.
+→ 마지막에 기준 설정을 한 번 더 재서 드리프트를 확인할 것.
+
+## 검증된 실행 방법
+
+### A. Colab + Python 3.9 venv (권장, AutoMasker 포함 전부 동작)
+
+`scripts/setup_env.py` 참고. 요지:
+
+```bash
+add-apt-repository -y ppa:deadsnakes/ppa
+apt-get install -y python3.9 python3.9-venv python3.9-dev
+python3.9 -m venv /content/venv39
+/content/venv39/bin/pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu121
+/content/venv39/bin/pip install accelerate==0.31.0 diffusers==0.29.2 huggingface_hub==0.23.4 \
+    transformers==4.27.3 numpy==1.26.4 opencv-python==4.10.0.84 pillow==10.3.0 PyYAML==6.0.1 \
+    scipy==1.13.1 scikit-image==0.24.0 tqdm==4.66.4 matplotlib==3.9.1 \
+    fvcore iopath pycocotools omegaconf hydra-core termcolor yacs tabulate cloudpickle
+```
+추가로 `av`도 설치해야 한다. 그 다음 추론 스크립트를
+`MPLBACKEND=Agg /content/venv39/bin/python worker.py` 로 실행 (노트북 커널이 아니라 subprocess).
+
+**검증 완료 (2026-09-08, Colab T4)**:
+- 환경 구성 219초 (Python 3.9 설치 21초, torch 2.1.2 171초, 나머지 48초)
+- `pipeline + automasker ready` → 추론 30스텝 71초 (2.40s/it)
+- **AutoMasker가 사람 몸 형태에 맞는 마스크를 정상 생성**, 배경 아티팩트 없는 결과 확인
+- venv의 torch 2.1.2는 `sm_50~sm_80` 지원 → **이 환경이면 Kaggle P100도 쓸 수 있다**
+
+### B. 최신 환경 + 사각형 마스크 (검증 완료, 품질 제한)
+
+`scripts/colab_minimal_rectmask.py`. detectron2/AutoMasker를 전혀 안 쓰고
+`skip_safety_check=True` + 직접 만든 사각형 마스크로 동작시킨 버전.
+
+**결과**: T4에서 30스텝 63초. 옷 합성 자체는 성공(질감·단추·프린트까지 재현)하지만,
+사각형 마스크가 몸 바깥 배경까지 덮어서 인물 뒤에 갈색 사각형 아티팩트가 남는다.
+
+**같은 코드를 CPU + 4스텝으로 돌리면** 형체 없는 갈색 덩어리만 나온다 (Kaggle 1차 시도).
+diffusion은 스텝 수가 부족하면 수렴 자체를 못 한다.
+
+## 성능 참고 (T4, 768x1024, 30 steps)
+
+| 항목 | 시간 |
+|---|---|
+| 가중치 다운로드 (최초 1회) | ~90초 (SD inpainting 3.44GB + CatVTON) |
+| 추론 30스텝 | 63초 (2.10s/it) |
+
+## Kaggle CLI 자동화 메모
+
+로컬에서 커널을 밀어넣고 결과를 받는 방법 (`kaggle/` 참고):
+```bash
+kaggle kernels push -p kaggle/          # kernel-metadata.json 필요
+kaggle kernels status <owner>/<slug>
+```
+- Windows에서는 `PYTHONUTF8=1 PYTHONIOENCODING=utf-8` 없으면 cp949 인코딩 에러가 난다.
+- 로그만 빠르게 받으려면 `api.kernels_logs(...)` (파일 다운로드 없이 로그만).
+- `/kaggle/working`에 clone하면 repo 전체가 kernel output으로 잡혀 다운로드가 지옥이 된다.
+  **clone은 `/kaggle/tmp`에, 결과만 `/kaggle/working`에 저장할 것.**
+- `kernel-metadata.json`의 `title`이 만드는 슬러그와 `id`가 다르면 커널은 **title 쪽 슬러그로**
+  만들어진다. 그러면 `status`/`output`이 `id`로 찾다가 "Permission denied"를 뱉는데,
+  권한 문제가 아니라 슬러그 불일치다. push 출력에 찍히는 URL의 슬러그가 진짜다.
+  (`VFA real garment check` → `vfa-real-garment-check`, `id`의 `...garments-check`와 어긋났다)
+- 데이터셋을 만들자마자 그걸 `dataset_sources`로 참조하는 커널을 밀면 **아직 처리 중이라
+  안 붙는다.** 커널은 그대로 실행되고 `/kaggle/input`만 비어 있어서, 데이터가 없다는
+  런타임 에러로만 드러난다. `kaggle datasets files <slug>`로 파일이 보이는지 확인하고 밀 것.
+
+### 저작권 있는 입력 이미지를 커널에 넣기
+쇼핑몰 상품 사진은 공개 저장소에 커밋하면 안 되므로 git clone으로는 커널에 못 보낸다.
+**비공개 Kaggle 데이터셋**으로 올려 `/kaggle/input`으로 받는다 (`kaggle_real/` 참고):
+```bash
+cd data/samples && kaggle datasets create -p .   # dataset-metadata.json 필요, 기본 비공개
+```
+`-p`에 긴 절대경로를 주면 kaggle 2.1.2가 업로드 임시 경로를 잘못 만들어 실패한다.
+**폴더 안에서 `-p .`로 실행할 것.**

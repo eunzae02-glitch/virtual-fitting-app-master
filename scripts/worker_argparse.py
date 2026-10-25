@@ -1,0 +1,44 @@
+"""배치 추론 워커 — 경로를 인자로 받아 결과 이미지를 저장한다.
+
+Python 3.9 venv에서 실행:
+    MPLBACKEND=Agg /content/venv39/bin/python scripts/worker_argparse.py \
+        --cloth-type lower --out /content/out_lower
+"""
+import argparse
+import glob
+import os
+import sys
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, 'app'))
+
+from paths import OUT_ROOT  # noqa: E402
+from tryon_core import (try_on, load_models, REPO_DIR, CLOTH_TYPES,  # noqa: E402
+                        DEFAULT_STEPS, DEFAULT_SCHEDULER, DEFAULT_GUIDANCE)
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--person', default=None, help='인물 사진 경로 (생략 시 저장소 데모 이미지)')
+ap.add_argument('--garment', default=None, help='옷 사진 경로 (생략 시 저장소 데모 이미지)')
+ap.add_argument('--cloth-type', default='upper', choices=CLOTH_TYPES)
+ap.add_argument('--steps', type=int, default=DEFAULT_STEPS)
+ap.add_argument('--scheduler', default=DEFAULT_SCHEDULER, choices=('ddim', 'dpm'))
+ap.add_argument('--guidance', type=float, default=DEFAULT_GUIDANCE,
+                help='1.0 이하면 CFG를 꺼서 약 2배 빨라진다')
+ap.add_argument('--out', default=os.path.join(OUT_ROOT, 'smoke'))
+a = ap.parse_args()
+
+load_models()
+print('pipeline + automasker ready', flush=True)
+
+person_path = a.person or sorted(glob.glob(os.path.join(REPO_DIR, 'resource/demo/example/person/men/*')))[0]
+garment_path = a.garment or sorted(glob.glob(os.path.join(REPO_DIR, 'resource/demo/example/condition/upper/*')))[0]
+print('person:', person_path, '| garment:', garment_path, '| type:', a.cloth_type, flush=True)
+
+result, mask_vis = try_on(person_path, garment_path, a.cloth_type,
+                          steps=a.steps, scheduler=a.scheduler,
+                          guidance_scale=a.guidance)
+
+os.makedirs(a.out, exist_ok=True)
+result.save(os.path.join(a.out, 'result.png'))
+mask_vis.save(os.path.join(a.out, 'mask.png'))
+print('DONE ->', a.out, flush=True)

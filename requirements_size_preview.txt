@@ -1,0 +1,5 @@
+# 목표 윤곽·옷 영역 편집·CPU 후처리. FASHN/GPU 환경은 별도로 준비한다.
+numpy>=2.0,<3
+Pillow>=10,<13
+opencv-python-headless>=4.10,<5
+gradio>=5,<7

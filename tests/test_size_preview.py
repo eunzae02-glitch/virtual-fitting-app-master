@@ -171,6 +171,7 @@ class TestSizePreview(unittest.TestCase):
         self.assertEqual(self.photo.tobytes(), original)
         self.assertEqual(render_outline(self.photo, preview=preview).size, self.photo.size)
 
+    @unittest.skipUnless((ROOT / 'debug').is_dir(), '개인 00_ME 사진/TXT가 없는 환경')
     def test_real_sample_remains_a_draft_until_reviewed(self):
         case, image, info, marks = load_sample()
         self.assertEqual((case.length_cm, case.shoulder_cm, case.chest_flat_cm), (65, 51, 52))
@@ -182,7 +183,7 @@ class TestSizePreview(unittest.TestCase):
     def test_gradio_photo_roundtrip_preserves_hash(self):
         import gradio as gr
 
-        _, photo, info, _ = load_sample()
+        photo, info = self.photo, self.info
         component = gr.Image(type='pil', format='png')
         restored = component.preprocess(component.postprocess(photo))
         self.assertEqual(photo_info(restored)['sha256'], info['sha256'])

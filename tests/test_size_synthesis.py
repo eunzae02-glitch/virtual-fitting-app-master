@@ -14,12 +14,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT/'app'))
 sys.path.insert(0, str(ROOT/'scripts'))
 
-from debug_size_preview import CHART_SOURCES, compare_dimensions
+from debug_size_preview import CHART_SOURCES, build_ui, compare_dimensions
 from fit_plan import create_fit_plan
 from garment_outline import confirm_anchors, create_preview, new_marks, photo_info
-from size_synthesis import (adjust_size, bind_base, checked_preview, draft_mask, editor_mask,
+from size_synthesis import (adjust_size, adjust_sizes, bind_base, checked_preview, draft_mask, editor_mask,
                             editor_value, engine_settings, generate_base)
-from size_synthesis_ui import mask_editor_payload, save_synthesis
+from size_synthesis_ui import mask_editor_payload, preprocess_mask_editor, save_synthesis
 
 
 class TestSizeSynthesis(unittest.TestCase):
@@ -76,6 +76,41 @@ class TestSizeSynthesis(unittest.TestCase):
                 if not chest:
                     self.assertEqual(result['report']['target_geometry_px']['chest_left'], -40)
         self.assertGreater(self.apply('S')['report']['repair_pixels'], 0)
+
+    def test_shrink_repair_does_not_copy_remaining_shirt_color_outside_target(self):
+        result = self.apply('S')
+        image = np.asarray(result['image'])
+        target = np.asarray(result['target_mask']) > 0
+        red = (image[:, :, 0] > 160) & (image[:, :, 1] < 90) & (image[:, :, 2] < 90)
+        self.assertTrue(red.any())
+        self.assertEqual(int((red & ~target).sum()), 0)  # v0 leaked 708 red pixels below the target hem
+        self.assertEqual(result['report']['repair_method'], 'garment_excluded_telea_v1')
+        self.assertEqual(result['report']['changed_pixels'], int(np.any(image != np.asarray(self.base), axis=2).sum()))
+
+    def test_all_sizes_share_base_but_have_independent_target_and_rgb_hashes(self):
+        before = self.base.tobytes(), self.mask.tobytes()
+        result, gallery = adjust_sizes(self.person, self.base, self.meta, self.preview(), self.mask, True)
+        rows = result['report']['size_comparison']['rows']
+        self.assertEqual([row['size'] for row in rows], ['S', 'M', 'L'])
+        self.assertEqual(len(gallery), 3)
+        self.assertEqual(len({row['adjusted_sha256'] for row in rows}), 3)
+        self.assertEqual(len({row['target_mask_sha256'] for row in rows}), 3)
+        self.assertEqual(result['report']['adjusted_sha256'], rows[1]['adjusted_sha256'])
+        hems = [row['target_geometry_px']['hem_y'] for row in rows]
+        self.assertTrue(hems[0] < hems[1] < hems[2])
+        self.assertEqual(before, (self.base.tobytes(), self.mask.tobytes()))
+
+    def test_all_sizes_keep_partial_review_and_withhold_out_of_frame_targets(self):
+        result, gallery = adjust_sizes(self.person, self.base, self.meta,
+                                       self.preview(chest=False), self.mask, True)
+        rows = result['report']['size_comparison']['rows']
+        self.assertTrue(all(not row['applied']['chest'] for row in rows))
+        self.assertTrue(all('보류' in caption for _, caption in gallery))
+        self.comparison['target_chart']['sizes'].append(
+            {'size': 'huge', 'length_cm': 650, 'shoulder_cm': 51, 'chest_flat_cm': 520})
+        result, gallery = adjust_sizes(self.person, self.base, self.meta, self.preview(), self.mask, True)
+        self.assertEqual(len(gallery), 3)
+        self.assertEqual(result['report']['size_comparison']['withheld'][0]['size'], 'huge')
 
     def test_generation_adapter_passes_fixed_settings_once_and_records_provenance(self):
         garment = Image.new('RGB', (120, 120), 'red')
@@ -146,8 +181,19 @@ class TestSizeSynthesis(unittest.TestCase):
         self.assertGreater(np.asarray(draft).sum(), 0)
         self.assertEqual(np.asarray(draft)[25, 150], 0)  # face is not a garment seed
 
+    def test_editor_upload_sharing_violation_retries_briefly_then_reports_persistent_lock(self):
+        reader = Mock(side_effect=[PermissionError('sharing violation'), {'layers': []}])
+        with patch('size_synthesis_ui.time.sleep') as delay:
+            self.assertEqual(preprocess_mask_editor(Mock(), None, reader), {'layers': []})
+        self.assertEqual(reader.call_count, 2)
+        delay.assert_called_once_with(.03)
+        reader = Mock(side_effect=PermissionError('locked'))
+        with patch('size_synthesis_ui.time.sleep'), self.assertRaisesRegex(ValueError, '업로드'):
+            preprocess_mask_editor(Mock(), None, reader)
+        self.assertEqual(reader.call_count, 6)
+
     def test_export_preserves_inputs_and_uses_new_run_directory(self):
-        result = self.apply('S')
+        result, _ = adjust_sizes(self.person, self.base, self.meta, self.preview('S'), self.mask, True)
         with tempfile.TemporaryDirectory() as directory:
             files, _ = save_synthesis(result, self.person, self.base, output_directory=directory)
             other, _ = save_synthesis(result, self.person, self.base, output_directory=directory)
@@ -156,8 +202,92 @@ class TestSizeSynthesis(unittest.TestCase):
             data = json.loads((Path(files[0]).parent/'synthesis.json').read_text(encoding='utf-8'))
             self.assertEqual(data['preview']['fit_plan']['selected_size'], 'S')
             self.assertEqual(data['base']['source'], 'external_unverified')
+            self.assertEqual([row['size'] for row in data['size_comparison']['rows']], ['S', 'M', 'L'])
+            self.assertEqual(data['adjusted_sha256'], data['size_comparison']['rows'][0]['adjusted_sha256'])
             with Image.open(Path(files[0]).parent/'adjusted.png') as image:
                 self.assertTrue(np.array_equal(np.asarray(image), np.asarray(result['image'])))
+
+
+class TestSynthesisUI(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.demo = build_ui()
+        cls.handlers = {event.fn.__name__: event.fn for event in cls.demo.fns.values() if event.fn}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.demo.close()
+
+    def setUp(self):
+        self.case = TestSizeSynthesis()
+        self.case.setUp()
+
+    def test_preview_events_apply_after_new_outline_instead_of_clearing_it(self):
+        dependencies = self.demo.config['dependencies']
+        for key, event in self.demo.fns.items():
+            if event.fn and event.fn.__name__ == 'display':
+                chained = [dep for dep in dependencies if dep.get('trigger_after') == key]
+                self.assertEqual(len(chained), 1)
+                self.assertEqual(self.demo.fns[chained[0]['id']].fn.__name__, 'refresh')
+
+    def test_one_generation_then_mask_review_and_size_changes_use_same_base(self):
+        case = self.case
+        garment = Image.new('RGB', (100, 100), 'blue')
+        engine = Mock(return_value=(case.base.copy(), {'seed': 42, 'total_s': .1}))
+        with patch('size_synthesis_ui.draft_mask', return_value=case.mask), patch(
+                'size_synthesis_ui.generate_base',
+                side_effect=lambda person, clothes, settings: generate_base(person, clothes, settings, engine)):
+            outputs = list(self.handlers['generate_with_status'](
+                case.preview(), case.person, garment, 42, 50, 2.5, progress=Mock()))
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(update['interactive'] is False for update in outputs[0][14:]))
+        self.assertTrue(all(isinstance(update.get('interactive'), bool) for update in outputs[-1][14:]))
+        runner = next(event for event in self.demo.fns.values()
+                      if event.fn and event.fn.__name__ == 'generate_with_status')
+        self.assertFalse(any(component.__class__.__name__ == 'ImageEditor' for component in runner.outputs[14:]))
+        metadata, base, edited, signature = outputs[-1][:4]
+        refresh = self.handlers['refresh']
+        unconfirmed = refresh(case.preview(), case.person, base, metadata, edited, False, garment)
+        self.assertIsNone(unconfirmed[0])
+        hashes = []
+        for size in ('S', 'M', 'L'):
+            applied = refresh(case.preview(size), case.person, base, metadata, edited, True, garment)
+            self.assertIsInstance(applied[0], Image.Image)
+            self.assertEqual(len(applied[2]), 3)
+            self.assertIn(f'선택 사이즈 {size}', applied[3])
+            hashes.append(photo_info(applied[0])['sha256'])
+        self.assertEqual(len(set(hashes)), 3)
+        engine.assert_called_once()
+        # 편집기의 동일 마스크 재전송은 이미 완료된 자동 적용을 지우지 않는다.
+        same_mask = self.handlers['mask_changed'](edited, signature, base)
+        self.assertTrue(all(value == {'__type__': 'update'} for value in same_mask))
+
+    def test_changed_photos_or_mask_review_do_not_keep_old_size_images(self):
+        case = self.case
+        edited = editor_value(case.base, case.mask)
+        changed = case.person.copy()
+        changed.putpixel((0, 0), (1, 1, 1))
+        output = self.handlers['refresh'](case.preview(), changed, case.base, case.meta, edited, True, None)
+        self.assertIsNone(output[0])
+        self.assertEqual(output[2], [])
+        output = self.handlers['refresh'](None, case.person, case.base, case.meta, edited, True, None)
+        self.assertIsNone(output[0])
+        self.assertEqual(output[2], [])
+        output = self.handlers['mask_changed'](editor_value(case.base, Image.new('L', case.base.size)),
+                                               'old_signature', case.base)
+        self.assertFalse(output[1])
+        self.assertIsNone(output[2])
+
+    def test_generation_failure_clears_outputs_and_restores_input_controls(self):
+        case = self.case
+        with patch('size_synthesis_ui.generate_base', side_effect=RuntimeError('GPU unavailable')):
+            outputs = list(self.handlers['generate_with_status'](
+                case.preview(), case.person, case.base, 42, 50, 2.5, progress=Mock()))
+        final = outputs[-1]
+        self.assertIsNone(final[0])
+        self.assertIn('GPU unavailable', final[5])
+        self.assertIsNone(final[6])
+        self.assertTrue(any(update.get('interactive') is True for update in final[14:]))
 
 
 if __name__ == '__main__':

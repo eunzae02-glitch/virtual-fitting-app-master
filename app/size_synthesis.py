@@ -1,6 +1,7 @@
 """FASHN 기본 합성과 확인한 옷 마스크를 목표 윤곽에 연결하는 CPU 후처리 실험."""
 import copy
 import hashlib
+import html
 import importlib.util
 import json
 import math
@@ -269,13 +270,23 @@ def adjust_size(person, base, metadata, preview, mask, confirmed=False):
     if not warped_mask.any():
         raise ValueError('변형 후 옷 영역이 없습니다. 마스크와 목표선을 확인해주세요.')
     repair = source_mask & ~warped_mask
-    canvas = cv2.inpaint(original, repair.astype(np.uint8)*255, 3, cv2.INPAINT_TELEA) if repair.any() else original.copy()
+    canvas = original.copy()
+    if repair.any():
+        # 사라진 부분만 inpaint하면 남은 옷이 주변색으로 유입돼 이전 밑단이 남는다.
+        # 복원용 영상에서는 기존 옷 전체(경계 1px 포함)를 제외한 뒤 필요한 부분만 가져온다.
+        excluded = cv2.dilate(source_mask.astype(np.uint8), np.ones((3, 3), np.uint8))
+        if excluded.all():
+            raise ValueError('옷 밖 복원 참고 영역이 없습니다. 옷 마스크를 확인해주세요.')
+        clean = cv2.inpaint(original, excluded*255, 3, cv2.INPAINT_TELEA)
+        canvas[repair] = clean[repair]
     # 옷 안쪽에서만 경계를 섞는다. 편집 영역 밖은 기본 합성과 화소 단위로 동일하다.
     alpha = np.clip(cv2.distanceTransform(warped_mask.astype(np.uint8), cv2.DIST_L2, 3)/2, 0, 1)[..., None]
     output = np.rint(warped*alpha + canvas*(1-alpha)).astype(np.uint8)
     edit = source_mask | warped_mask
     output[~edit] = original[~edit]
-    report = {'schema_version': 1, 'transform_version': 'masked_torso_warp_v0',
+    changed = np.any(output != original, axis=2)
+    mask_y, mask_x = np.nonzero(warped_mask)
+    report = {'schema_version': 1, 'transform_version': 'masked_torso_warp_v1',
               'preview': preview, 'base': copy.deepcopy(metadata), 'source_geometry_px': geometry,
               'target_geometry_px': {'chest_y': target_chest_y, 'hem_y': target_hem_y,
                                      'chest_left': float(chest_l[0]), 'chest_right': float(chest_r[0]),
@@ -283,11 +294,16 @@ def adjust_size(person, base, metadata, preview, mask, confirmed=False):
               'mask_sha256': hashlib.sha256(source_mask.tobytes()).hexdigest(),
               'preview_sha256': _digest(preview), 'mask_confirmed': True,
               'repair_pixels': int(repair.sum()), 'edited_pixels': int(edit.sum()),
+              'changed_pixels': int(changed.sum()),
+              'adjusted_sha256': photo_info(Image.fromarray(output))['sha256'],
+              'target_mask_sha256': hashlib.sha256(warped_mask.tobytes()).hexdigest(),
+              'target_mask_bbox_px': [int(mask_x.min()), int(mask_y.min()), int(mask_x.max()), int(mask_y.max())],
+              'repair_method': 'garment_excluded_telea_v1',
               'outside_edit_max_pixel_difference': int(np.abs(output.astype(int)-original.astype(int))[~edit].max())
               if (~edit).any() else 0,
               'notes': ['기본 합성 결과에서 확인한 옷 영역을 목표선에 맞춘 2D 후처리 실험입니다.',
                         '생성된 옷의 길이와 폭은 마스크에서 읽습니다. 기본 합성에 특정 상품 사이즈를 가정하지 않습니다.',
-                        '줄여서 드러난 영역은 Telea로 복원합니다. 가려졌던 신체·무늬·소재의 정답 복원이 아닙니다.',
+                        '줄어든 부분은 기존 옷 전체를 제외한 영상에서 Telea로 복원합니다. 가려졌던 신체·배경의 정답 복원이 아닙니다.',
                         '어깨·소매 구조 보정과 실제 착용 핏 정확도는 검증하지 않았습니다.',
                         '편집 영역 밖은 기본 합성 사진을 유지합니다. FASHN 자체가 바꾼 얼굴·배경은 이 단계의 보존 대상과 별개입니다.']}
     return {'image': Image.fromarray(output), 'mask': Image.fromarray(source_mask.astype(np.uint8)*255),
@@ -295,12 +311,64 @@ def adjust_size(person, base, metadata, preview, mask, confirmed=False):
             'repair_mask': Image.fromarray(repair.astype(np.uint8)*255), 'report': report}
 
 
+def adjust_sizes(person, base, metadata, preview, mask, confirmed=False):
+    """한 기본 합성·한 확인 마스크에 판매 사이즈별 목표선을 독립적으로 적용한다."""
+    preview = checked_preview(preview, person)
+    selected = preview['fit_plan']['selected_size']
+    result = adjust_size(person, base, metadata, preview, mask, confirmed)
+    results, summaries, withheld = [], [], []
+    for row in preview['fit_plan']['comparison']['target_chart']['sizes']:
+        label = row['size']
+        try:
+            if label == selected:
+                current = result
+            else:
+                plan = create_fit_plan(preview['fit_plan']['comparison'], label)
+                review = preview['review']
+                target = create_preview(plan, preview['photo'], preview['anchors'],
+                                        review['same_garment'], review['length_compatible'],
+                                        review['chest_compatible'], False)
+                current = adjust_size(person, base, metadata, target, mask, confirmed)
+            data = current['report']
+            ratios = data['preview']['fit_plan']['ratios']
+            length_label = f'×{ratios["length"]:.3f}' if data['preview']['applied']['length'] else '보류'
+            chest_label = f'×{ratios["chest"]:.3f}' if data['preview']['applied']['chest'] else '보류'
+            caption = f'{label} · 총장 {length_label} · 가슴단면 {chest_label}'
+            results.append((current['image'], caption))
+            summaries.append({'size': label, 'applied': data['preview']['applied'], 'ratios': ratios,
+                              'target_geometry_px': data['target_geometry_px'],
+                              'adjusted_sha256': data['adjusted_sha256'],
+                              'target_mask_sha256': data['target_mask_sha256'],
+                              'changed_pixels': data['changed_pixels']})
+        except ValueError as exc:
+            withheld.append({'size': label, 'reason': str(exc)})
+    result['report']['size_comparison'] = {'rows': summaries, 'withheld': withheld,
+                                         'base_reused': True}
+    return result, results
+
+
 def synthesis_report(result):
     data = result['report']
     source = data['base']['source']
     label = {'fashn': 'FASHN 생성', 'external_unverified': '외부 합성 결과 (엔진·설정 미확인)',
              'reference_photo_dry_run': '기준 사진 변형 테스트 · 새 옷 합성 아님'}[source]
-    return (f"기본 사진 출처: **{label}**\n\n"
+    selected = html.escape(data['preview']['fit_plan']['selected_size']).replace('|', '\\|')
+    text = (f"### 선택 사이즈 {selected} · 치수 적용 완료\n\n"
+            f"기본 사진 출처: **{label}** · 기본 합성 재사용 / 길이·몸통 폭 후처리\n\n"
+            f"실제 변경 화소: **{data['changed_pixels']:,} px**\n\n"
             f"편집 영역 밖 최대 화소 차이: **{data['outside_edit_max_pixel_difference']}** / "
             f"복원 영역: **{data['repair_pixels']:,} px**\n\n"
             + '\n\n'.join(data['notes']))
+    comparison = data.get('size_comparison')
+    if comparison:
+        lines = ['| 사이즈 | 목 기준 밑단(px) | 목표 몸통 폭(px) | 변경 화소 |',
+                 '|---|---:|---:|---:|']
+        for row in comparison['rows']:
+            geometry = row['target_geometry_px']
+            size = html.escape(row['size']).replace('|', '\\|')
+            lines.append(f"| {size} | {geometry['hem_y']:.1f} | "
+                         f"{geometry['chest_right']-geometry['chest_left']:.1f} | {row['changed_pixels']:,} |")
+        for item in comparison['withheld']:
+            lines += ['', f"변형 보류: {html.escape(item['size'])} — {html.escape(item['reason'])}"]
+        text += '\n\n' + '\n'.join(lines)
+    return text

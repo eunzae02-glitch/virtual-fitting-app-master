@@ -3,6 +3,7 @@
 프로젝트 루트에서: python -X utf8 scripts/debug_size_preview.py --ui
 """
 import argparse
+import inspect
 import json
 import sys
 from datetime import datetime, timezone
@@ -43,7 +44,7 @@ def compare_dimensions(length, shoulder, chest, reference_style, target_style, t
 
 def mark_status(marks):
     if not marks:
-        return '사진을 업로드하거나 00_ME 예시를 불러와주세요.'
+        return '치수를 입력한 기준 옷을 입은 사진을 업로드해주세요.'
     done = sum(key in marks['points'] for key in REQUIRED)
     status = '확인 완료' if marks['confirmed'] else '위치 확인 필요'
     return f'필수 기준점 {done}/5 · {status}. 좌우는 사진을 보는 방향입니다.'
@@ -104,9 +105,10 @@ def build_ui():
         gr.Markdown('# 사이즈별 목표 윤곽 미리보기\n\n'
                     '기준 옷과 새 옷의 치수를 연결하고 사진 위에서 길이·몸통 폭 변화를 확인합니다. '
                     '**상품 치수비를 적용한 실험용 목표선**을 만든 뒤, 4단계에서 옷 영역을 조정해봅니다.')
-        sample = gr.Button('00_ME 사진·기준 옷 + 가상 S/M/L 불러오기')
-        gr.Markdown('00_ME의 기준 옷은 기록된 상품 치수입니다. 함께 채워지는 새 옷 S/M/L은 '
-                    '**가상 테스트 값**이며, 사진의 5점도 눈으로 잡은 미확인 초안입니다.')
+        has_sample = (ROOT / 'debug').is_dir()
+        sample = gr.Button('00_ME 사진·기준 옷 + 가상 S/M/L 불러오기', visible=has_sample)
+        gr.Markdown('직접 올린 기준 옷 착용 사진과 치수로 진행할 수 있습니다. '
+                    '00_ME 예시가 있는 환경에서만 예시 불러오기 버튼이 표시됩니다.')
         comparison = gr.State(None)
         info = gr.State(None)
         marks = gr.State(None)
@@ -122,11 +124,14 @@ def build_ui():
             with gr.Column(scale=2):
                 chart_source = gr.Radio(CHART_SOURCES, value=CHART_SOURCES[0], label='새 옷 치수 출처')
                 target_style = gr.State('확인 필요')
+                counts = ({'row_count': 3, 'column_count': 4}
+                          if 'column_count' in inspect.signature(gr.Dataframe).parameters
+                          else {'row_count': (3, 'dynamic'), 'col_count': (4, 'fixed')})
                 table = gr.Dataframe(headers=['판매 사이즈', '총장 (cm)', '어깨너비 (cm)', '가슴단면 (cm)'],
                                      datatype=['str', 'number', 'number', 'number'], type='array',
                                      value=[['S', None, None, None], ['M', None, None, None],
-                                            ['L', None, None, None]], row_count=(3, 'dynamic'),
-                                     col_count=(4, 'fixed'), interactive=True, label='새 옷 치수표')
+                                            ['L', None, None, None]],
+                                     **counts, interactive=True, label='새 옷 치수표')
         compare = gr.Button('치수 연결', variant='primary')
         comparison_report = gr.Markdown(PROMPT)
 
@@ -252,23 +257,30 @@ def build_ui():
         reset.click(reset_points, inputs=[source_photo, info],
                     outputs=[marks, editor, point, status, *preview_outputs], queue=False)
         preview_inputs = [comparison, selected, source_photo, info, marks, same, length_ok, chest_ok, shoulders]
-        show.click(display, inputs=preview_inputs, outputs=preview_outputs, api_name='preview_outline', queue=False)
+        preview_events = [show.click(display, inputs=preview_inputs, outputs=preview_outputs,
+                                     api_name='preview_outline', queue=False)]
         for control in (selected, same, length_ok, chest_ok):
-            control.input(display, inputs=preview_inputs, outputs=preview_outputs, queue=False)
+            preview_events.append(control.input(display, inputs=preview_inputs,
+                                                 outputs=preview_outputs, queue=False))
         save.click(export, inputs=preview_inputs, outputs=[downloads, saved], api_name='save_preview', queue=False)
         add_synthesis_ui(gr, preview, source_photo,
-                         reset_controls=[length, shoulder, chest, table, chart_source, selected,
-                                         same, length_ok, chest_ok],
-                         reset_buttons=[compare, confirm, reset], point_editor=editor, sample=sample)
-    return demo
+                         reset_controls=[length, shoulder, chest, table, chart_source],
+                         reset_buttons=[compare, confirm, reset], point_editor=editor, sample=sample,
+                         preview_events=preview_events,
+                         busy_controls=[length, shoulder, chest, table, chart_source, selected,
+                                        same, length_ok, chest_ok, compare, confirm, reset, show, save,
+                                        editor, point, sample])
+    return demo.queue(max_size=4, default_concurrency_limit=1)
 
 
 def main():
     parser = argparse.ArgumentParser(description='기준 옷과 새 옷 사이즈별 목표 윤곽 미리보기')
     parser.add_argument('--ui', action='store_true', help='웹 UI 실행 (생략해도 실행)')
-    parser.add_argument('--port', type=int, default=7867)
+    parser.add_argument('--share', action='store_true', help='코랩용 공개 Gradio 링크 생성')
+    parser.add_argument('--port', type=int, default=None, help='생략하면 비어 있는 포트 자동 선택')
     args = parser.parse_args()
-    build_ui().launch(server_name='127.0.0.1', server_port=args.port, share=False,
+    build_ui().launch(server_name='0.0.0.0' if args.share else '127.0.0.1',
+                      server_port=args.port, share=args.share,
                       allowed_paths=[str(ROOT / 'outputs' / 'size_preview'),
                                      str(ROOT / 'outputs' / 'size_synthesis')])
 

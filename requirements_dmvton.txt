@@ -1,0 +1,9 @@
+# Colab의 기존 CUDA PyTorch를 사용한다. 원본의 구형 CuPy/CUDA 11 설치는 필요하지 않다.
+torch>=2.2
+numpy>=2,<3
+Pillow>=10,<13
+gradio>=5,<7
+opencv-python>=4.10,<5
+fashn-human-parser==0.1.1
+transformers>=4.40,<5
+gdown>=5,<6

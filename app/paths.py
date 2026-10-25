@@ -41,6 +41,8 @@ CATVTON_REPO = os.environ.get('CATVTON_REPO', os.path.join(SCRATCH, 'CatVTON'))
 # FASHN VTON v1.5 (앱 주력 엔진, app/fashn_core.py). CatVTON venv와 달리 기본 파이썬(3.10+)에서 돈다
 FASHN_REPO = os.environ.get('FASHN_REPO', os.path.join(SCRATCH, 'fashn-vton-1.5'))
 FASHN_WEIGHTS = os.environ.get('FASHN_WEIGHTS', os.path.join(SCRATCH, 'fashn-weights'))
+DMVTON_REPO = os.environ.get('DMVTON_REPO', os.path.join(SCRATCH, 'DM-VTON'))
+DMVTON_WEIGHTS = os.environ.get('DMVTON_WEIGHTS', os.path.join(SCRATCH, 'dmvton-weights'))
 
 PLATFORM = 'kaggle' if IS_KAGGLE else ('colab' if IS_COLAB else 'local')
 

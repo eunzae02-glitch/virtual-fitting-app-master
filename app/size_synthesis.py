@@ -162,10 +162,11 @@ def draft_mask(base, preview):
 
 
 def editor_value(base, mask):
+    """원본 배경과 편집 마스크만 전달한다. 합쳐진 composite를 배경으로 재사용하지 않는다."""
     layer = Image.new('RGBA', base.size, (32, 200, 170, 0))
     layer.putalpha(mask.point(lambda value: 130 if value else 0))
     return {'background': base.convert('RGBA'), 'layers': [layer],
-            'composite': Image.alpha_composite(base.convert('RGBA'), layer)}
+            'composite': None}
 
 
 def editor_mask(value, base):

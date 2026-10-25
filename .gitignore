@@ -11,6 +11,8 @@ data/garment/*
 
 __pycache__/
 *.py[cod]
+# Gradio가 옷 마스크 편집기 import 시 자동 생성하는 타입 스텁.
+/scripts/garment_mask_editor.pyi
 .ipynb_checkpoints/
 *.ckpt
 *.safetensors

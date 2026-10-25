@@ -10,6 +10,7 @@ import sys
 from unittest.mock import Mock, patch
 
 import gradio as gr
+import numpy as np
 from playwright.sync_api import expect, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -17,7 +18,7 @@ for folder in ('app', 'scripts', 'tests'):
     sys.path.insert(0, str(ROOT / folder))
 
 from debug_size_preview import CHART_SOURCES, build_ui  # noqa: E402
-from size_synthesis import generate_base  # noqa: E402
+from size_synthesis import editor_mask, generate_base  # noqa: E402
 from test_size_synthesis import TestSizeSynthesis  # noqa: E402
 
 
@@ -36,7 +37,8 @@ def main():
     for block, elem_id in [(selected, 'smoke_size'), (generate, 'smoke_generate'),
                            (approved, 'smoke_approved'), (report, 'smoke_report'),
                            (adjusted, 'smoke_result'), (gallery, 'smoke_gallery'),
-                           (runner.outputs[5], 'smoke_base_status')]:
+                           (runner.outputs[5], 'smoke_base_status'),
+                           (refresh.inputs[4], 'smoke_editor')]:
         block.elem_id = elem_id
     style = case.comparison['source']['shoulder_style']
     rows = [['S', 55, 49, 46], ['M', 65, 51, 52], ['L', 75, 53, 58]]
@@ -48,6 +50,12 @@ def main():
     with demo:
         demo.load(lambda: tuple(initial), inputs=[], outputs=load_outputs)
     engine = Mock(return_value=(case.base.copy(), {'seed': 42, 'total_s': .01}))
+    observed_masks = []
+
+    def read_mask(value, base):
+        mask = editor_mask(value, base)
+        observed_masks.append(np.asarray(mask).copy())
+        return mask
 
     def fake_generate(photo, clothes, settings):
         return generate_base(photo, clothes, settings, engine)
@@ -59,7 +67,8 @@ def main():
     browser = None
     try:
         with patch('size_synthesis_ui.generate_base', side_effect=fake_generate), patch(
-                'size_synthesis_ui.draft_mask', return_value=case.mask), sync_playwright() as p:
+                'size_synthesis_ui.draft_mask', return_value=case.mask), patch(
+                'size_synthesis_ui.editor_mask', side_effect=read_mask), sync_playwright() as p:
             _, url, _ = demo.launch(server_name='127.0.0.1', server_port=None,
                                     prevent_thread_lock=True, quiet=True)
             print('Server ready:', url, flush=True)
@@ -85,6 +94,34 @@ def main():
                 print('Base created, engine calls:', engine.call_count, flush=True)
                 page.locator('#smoke_approved input').check(timeout=15000)
                 expect(page.locator('#smoke_report')).to_contain_text('선택 사이즈 M', timeout=30000)
+                assert np.array_equal(observed_masks[-1], np.asarray(case.mask))
+                editor = page.locator('#smoke_editor')
+                editor.scroll_into_view_if_needed()
+                canvas = editor.locator('canvas').first
+                expect(canvas).to_be_visible(timeout=15000)
+                # 초기 초안 위를 직접 지웠다 칠한다. 확인 체크만 하는 시험으로는 이 오류를 못 잡는다.
+                counts = [int(np.count_nonzero(observed_masks[-1]))]
+                for tool in ('지우개', '브러시', '지우개'):
+                    editor.get_by_role('button', name=tool, exact=True).click()
+                    bounds = canvas.bounding_box()
+                    x, y = bounds['x']+bounds['width']*.5, bounds['y']+bounds['height']*.375
+                    page.mouse.move(x, y)
+                    page.mouse.down()
+                    page.mouse.move(x+6, y+3, steps=6)
+                    page.mouse.up()
+                    expect(page.locator('#smoke_approved input')).not_to_be_checked(timeout=15000)
+                    expect(page.locator('#smoke_report')).not_to_contain_text('선택 사이즈 M', timeout=15000)
+                    page.locator('#smoke_approved input').check()
+                    expect(page.locator('#smoke_report')).to_contain_text('선택 사이즈 M', timeout=15000)
+                    counts.append(int(np.count_nonzero(observed_masks[-1])))
+                assert 0 < counts[1] < counts[0], counts
+                assert counts[2] > counts[1], counts
+                assert counts[3] < counts[2], counts
+                editor.get_by_role('button', name='초안으로 되돌리기', exact=True).click()
+                expect(page.locator('#smoke_approved input')).not_to_be_checked(timeout=15000)
+                page.locator('#smoke_approved input').check()
+                expect(page.locator('#smoke_report')).to_contain_text('선택 사이즈 M', timeout=15000)
+                assert np.array_equal(observed_masks[-1], np.asarray(case.mask))
                 sources = []
                 for size in ('S', 'M', 'L'):
                     page.locator('#smoke_size input').click()
@@ -99,10 +136,13 @@ def main():
                 assert not errors, errors
                 assert not failed_responses, failed_responses
                 print(json.dumps({'base_generations': engine.call_count,
+                                  'mask_pixels_initial_erased_painted': counts[:3],
+                                  'draft_reset_verified': True,
                                   'distinct_size_images': len(set(sources)), 'browser_errors': errors,
                                   'failed_responses': failed_responses}), flush=True)
             except Exception:
                 print('Engine calls:', engine.call_count, 'Browser errors:', errors, flush=True)
+                print('Observed mask pixels:', [int(np.count_nonzero(mask)) for mask in observed_masks], flush=True)
                 print('Queued handlers:', [demo.fns[index].fn.__name__ for index in requests], flush=True)
                 print('Active jobs:', repr(demo._queue.active_jobs), flush=True)
                 print('Statuses:', page.locator('[data-testid="status-tracker"]').all_text_contents(), flush=True)

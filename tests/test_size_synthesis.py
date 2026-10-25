@@ -17,9 +17,10 @@ sys.path.insert(0, str(ROOT/'scripts'))
 from debug_size_preview import CHART_SOURCES, build_ui, compare_dimensions
 from fit_plan import create_fit_plan
 from garment_outline import confirm_anchors, create_preview, new_marks, photo_info
+from garment_mask_editor import GarmentMaskEditor, encode_png
 from size_synthesis import (adjust_size, adjust_sizes, bind_base, checked_preview, draft_mask, editor_mask,
                             editor_value, engine_settings, generate_base)
-from size_synthesis_ui import mask_editor_payload, preprocess_mask_editor, save_synthesis
+from size_synthesis_ui import save_synthesis
 
 
 class TestSizeSynthesis(unittest.TestCase):
@@ -160,37 +161,39 @@ class TestSizeSynthesis(unittest.TestCase):
         self.assertEqual(before, (self.base.tobytes(), self.mask.tobytes()))
 
     def test_editor_keeps_alpha_and_hash_through_gradio_roundtrip(self):
-        import gradio as gr
-
-        editor = gr.ImageEditor(type='pil', format='png')
+        editor = GarmentMaskEditor()
         payload = editor_value(self.base, self.mask)
+        self.assertIsNone(payload['composite'])
         posted = editor.postprocess(payload)
-        # 화면용 composite가 아직 업로드 중이어도 원본/레이어만으로 마스크를 확정할 수 있다.
-        posted = posted.model_copy(update={'composite': posted.composite.model_copy(update={'path': 'missing_composite.png'})})
-        restored = editor.preprocess(mask_editor_payload(editor, posted))
+        restored = editor.preprocess(posted)
         self.assertTrue(np.array_equal(np.asarray(editor_mask(restored, self.base)), np.asarray(self.mask)))
-        restored['layers'] = []
-        self.assertFalse(np.asarray(editor_mask(restored, self.base)).any())
-        restored['background'] = self.person
-        with self.assertRaises(ValueError):
-            editor_mask(restored, self.base)
+        value = json.loads(posted)
+        # 지우개는 초기 초안 자체에서도 영역을 지울 수 있다. 배경은 그대로여야 한다.
+        layer = payload['layers'][0].copy()
+        ImageDraw.Draw(layer).rectangle((140, 120, 160, 140), fill=(0, 0, 0, 0))
+        value['layer'] = encode_png(layer)
+        restored = editor.preprocess(json.dumps(value))
+        mask = np.asarray(editor_mask(restored, self.base))
+        self.assertFalse(mask[130, 150])
+        self.assertTrue(mask[180, 150])
+        self.assertEqual(restored['background'].convert('RGB').tobytes(), self.base.tobytes())
+        value['background'] = encode_png(self.person)
+        with self.assertRaisesRegex(ValueError, '사진이 바뀌었습니다'):
+            editor_mask(editor.preprocess(json.dumps(value)), self.base)
+
+    def test_mask_editor_rejects_invalid_or_resized_payloads(self):
+        editor = GarmentMaskEditor()
+        payload = json.loads(editor.postprocess(editor_value(self.base, self.mask)))
+        for value in ('not json', '{}', '[]', json.dumps(dict(payload, layer='not png')),
+                      json.dumps(dict(payload, layer=encode_png(Image.new('RGBA', (10, 10)))))):
+            with self.subTest(value=value[:30]), self.assertRaises(ValueError):
+                editor.preprocess(value)
 
     def test_mask_draft_uses_image_and_is_editable_before_review(self):
         draft = draft_mask(self.base, self.preview())
         self.assertEqual(draft.size, self.base.size)
         self.assertGreater(np.asarray(draft).sum(), 0)
         self.assertEqual(np.asarray(draft)[25, 150], 0)  # face is not a garment seed
-
-    def test_editor_upload_sharing_violation_retries_briefly_then_reports_persistent_lock(self):
-        reader = Mock(side_effect=[PermissionError('sharing violation'), {'layers': []}])
-        with patch('size_synthesis_ui.time.sleep') as delay:
-            self.assertEqual(preprocess_mask_editor(Mock(), None, reader), {'layers': []})
-        self.assertEqual(reader.call_count, 2)
-        delay.assert_called_once_with(.03)
-        reader = Mock(side_effect=PermissionError('locked'))
-        with patch('size_synthesis_ui.time.sleep'), self.assertRaisesRegex(ValueError, '업로드'):
-            preprocess_mask_editor(Mock(), None, reader)
-        self.assertEqual(reader.call_count, 6)
 
     def test_export_preserves_inputs_and_uses_new_run_directory(self):
         result, _ = adjust_sizes(self.person, self.base, self.meta, self.preview('S'), self.mask, True)
@@ -229,6 +232,16 @@ class TestSynthesisUI(unittest.TestCase):
                 chained = [dep for dep in dependencies if dep.get('trigger_after') == key]
                 self.assertEqual(len(chained), 1)
                 self.assertEqual(self.demo.fns[chained[0]['id']].fn.__name__, 'refresh')
+
+    def test_mask_editor_roundtrip_can_be_applied_without_a_flattened_composite(self):
+        event = next(event for event in self.demo.fns.values()
+                     if event.fn and event.fn.__name__ == 'refresh')
+        editor = event.inputs[4]
+        case = self.case
+        edited = editor.preprocess(editor.postprocess(editor_value(case.base, case.mask)))
+        result = event.fn(case.preview(), case.person, case.base, case.meta, edited, True, None)
+        self.assertIsInstance(result[0], Image.Image)
+        self.assertIn('선택 사이즈 M', result[3])
 
     def test_one_generation_then_mask_review_and_size_changes_use_same_base(self):
         case = self.case

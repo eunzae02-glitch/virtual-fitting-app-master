@@ -2,4 +2,5 @@
 numpy>=2.0,<3
 Pillow>=10,<13
 opencv-python-headless>=4.10,<5
-gradio>=5,<7
+# 원본 고정·마스크 전용 HTML 편집기를 검증한 버전.
+gradio==6.30.0

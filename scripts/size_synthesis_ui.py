@@ -1,7 +1,6 @@
 """목표 윤곽 디버거의 기본 합성·마스크 확인·사이즈 조정 화면."""
 import hashlib
 import json
-import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +8,7 @@ from pathlib import Path
 from PIL import Image
 
 from garment_outline import photo_info, prepare_photo, render_outline
+from garment_mask_editor import GarmentMaskEditor
 from size_synthesis import (adjust_sizes, bind_base, checked_preview, draft_mask,
                             editor_mask, editor_value, engine_settings, generate_base,
                             synthesis_report)
@@ -16,31 +16,6 @@ from size_synthesis import (adjust_sizes, bind_base, checked_preview, draft_mask
 
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT = 'FASHN 기본 합성을 준비하고 옷 영역을 확인하면 **판매 사이즈별 치수가 자동 적용**됩니다.'
-
-
-def mask_editor_payload(editor, payload):
-    """확인에 쓰는 원본/레이어만 읽고 불필요한 합성 PNG의 비동기 업로드를 기다리지 않는다."""
-    if payload is None:
-        return None
-    updates = {'composite': None}
-    if payload.id is not None:
-        cached = editor.blob_storage.pop(payload.id, None)
-        if cached is None:
-            return None
-        updates.update(id=None, background=cached.background, layers=cached.layers)
-    return payload.model_copy(update=updates)
-
-
-def preprocess_mask_editor(editor, payload, preprocess):
-    payload = mask_editor_payload(editor, payload)
-    for attempt in range(6):
-        try:
-            return preprocess(payload)
-        except PermissionError as exc:
-            # Windows에서 레이어 자동 업로드가 캐시 파일을 쓰는 동안 읽기 요청이 겹칠 수 있다.
-            if attempt == 5:
-                raise ValueError('옷 영역 업로드가 끝나지 않았습니다. 잠시 후 다시 확인해주세요.') from exc
-            time.sleep(.03)
 
 
 def save_synthesis(result, person, base, garment=None, output_directory=None):
@@ -96,11 +71,7 @@ def add_synthesis_ui(gr, preview, person, reset_controls=(), reset_buttons=(), p
     gr.Markdown('### 옷 영역 확인\n\n'
                 '초록색은 자동 추출한 옷 영역 초안입니다. 빠진 옷은 브러시로 칠하고, '
                 '팔·손·얼굴·바지·배경은 지우개로 지워주세요. 사진을 자르거나 확대 변형하지 않습니다.')
-    mask_editor = gr.ImageEditor(type='pil', format='png', sources=[], transforms=[], layers=False,
-                                brush=gr.Brush(colors=['#20c8aa'], color_mode='fixed'),
-                                eraser=gr.Eraser(), label='옷 영역 수정', height=560)
-    original_preprocess = mask_editor.preprocess
-    mask_editor.preprocess = lambda payload: preprocess_mask_editor(mask_editor, payload, original_preprocess)
+    mask_editor = GarmentMaskEditor()
     approved = gr.Checkbox(value=False, label='초록색 영역이 옷에만 해당하는 것을 확인했습니다')
     apply = gr.Button('선택 사이즈 다시 적용', variant='secondary')
     with gr.Row():
@@ -200,7 +171,7 @@ def add_synthesis_ui(gr, preview, person, reset_controls=(), reset_buttons=(), p
 
     base_outputs = [metadata, base, mask_editor, mask_signature, approved, base_status, *result_outputs]
     generation_inputs = [preview, person, garment, seed, steps, guidance]
-    # ImageEditor는 interactive 갱신 시 내부 canvas를 재생성하므로 스트리밍 제어 대상에서 제외한다.
+    # 편집기는 생성 시작 시 값을 비우며, 스트리밍 중 캔버스 자체를 다시 만들지 않는다.
     controls = list(dict.fromkeys([*busy_controls, person, garment, base, approved,
                                    apply, save, seed, steps, guidance, generate, dry_run]))
     # None은 최초 렌더의 자동 판정값이다. update(None)으로는 잠근 입력이 다시 열리지 않는다.
